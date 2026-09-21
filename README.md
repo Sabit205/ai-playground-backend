@@ -32,9 +32,23 @@ npm install
 npm start          # http://localhost:5000
 ```
 
+## Security & environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `APP_SECRET_TOKEN` | Shared secret; API calls must send it as the `x-app-token` header. **Set this in production** — generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`. Same value goes into the frontend's `NEXT_PUBLIC_APP_TOKEN`. |
+| `ALLOWED_ORIGIN` | Comma-separated CORS allowlist of frontend origins (e.g. `https://your-app.vercel.app`). Unset = reflect any origin (dev only). |
+| `RATE_LIMIT_PER_MIN` | Per-IP request limit per minute (default `60`). |
+| `BLOCK_PRIVATE_HOSTS` | `true` blocks SSRF targets (localhost/private IPs). Leave unset to keep Ollama support. |
+| `UPSTREAM_TIMEOUT_MS` | Upstream call timeout (default `120000`). |
+
+Other protections included: `helmet` security headers, strict input validation
+(provider allowlist, URL scheme check, size caps, model-name charset), request
+body limits, and 4s/2min upstream timeouts.
+
 ## Notes
 
-- CORS is open (`*`) because the frontend is a public testing tool and the
-  user supplies their own API keys per request; nothing is stored server-side.
+- CORS is controlled via `ALLOWED_ORIGIN` — no secrets are stored server-side;
+  the user's API key is relayed per request and never logged.
 - Upstream errors are forwarded with their original status codes so the
   frontend can show exactly what the provider returned.

@@ -2,12 +2,12 @@
    OmniAI Backend — hardened for production
    - helmet security headers
    - strict CORS (ALLOWED_ORIGIN env, comma-separated allowlist)
-   - shared-secret auth (x-app-token === APP_SECRET_TOKEN) — doubles as the
-     CSRF defense: custom headers can't be sent by cross-site form posts
+   - shared-secret auth (x-app-token === APP_SECRET_TOKEN)
    - per-IP rate limiting (in-memory sliding window)
    - strict input validation (provider allowlist, URL scheme, size caps)
    - optional SSRF guard (BLOCK_PRIVATE_HOSTS=true disallows internal targets)
-   - upstream call timeouts
+   - SSE transport with keep-alive heartbeats so long model "thinking time"
+     never looks like an idle connection (prevents proxy 504s on Render)
    ========================================================================== */
 
 const express = require('express');
@@ -74,7 +74,8 @@ function rateLimit(req, res, next) {
 }
 
 const PORT = process.env.PORT || 5000;
-const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || '120000', 10);
+const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || '300000', 10);
+const HEARTBEAT_INTERVAL_MS = parseInt(process.env.HEARTBEAT_INTERVAL_MS || '15000', 10);
 const BLOCK_PRIVATE_HOSTS = process.env.BLOCK_PRIVATE_HOSTS === 'true';
 
 // ---------------------------------------------------------------------------
@@ -102,7 +103,7 @@ function isPrivateHost(hostname) {
   );
 }
 
-/** Validate the /api/chat body. Returns { ok, value, error }. */
+/** Validate the /api/chat body. Returns { value } or { error }. */
 function validateChatBody(body = {}) {
   const providerType = PROVIDER_TYPES.has(body.providerType) ? body.providerType : null;
   if (!providerType) return { error: 'providerType must be one of: openai, anthropic, gemini' };
@@ -294,7 +295,7 @@ function extractDelta(providerType, parsed) {
 // Routes
 // ---------------------------------------------------------------------------
 
-// Health check: public, unthrottled (used by Render)
+// Health check: public, unthrottled (used by Render health checks + UptimeRobot)
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
@@ -328,75 +329,129 @@ app.post('/api/models', async (req, res) => {
   }
 });
 
-// Chat — backend builds the payload, calls the provider, streams text back.
-// Response body is a plain text stream (streaming) or { text, usage } JSON.
+// Chat — always answered as an SSE stream so the response starts instantly
+// and NEVER looks idle to load balancers/proxies (Render kills silent
+// connections with 504):
+//   : ka                      keep-alive comment every 15s during silence
+//   {"t":"..."}               streamed text delta
+//   {"text":...,"usage":...}  final result (non-streaming clients)
+//   {"error":"..."}           upstream failure after headers were sent
+//   {"done":true}             terminal event
 app.post('/api/chat', async (req, res) => {
   const check = validateChatBody(req.body);
   if (check.error) return res.status(400).json({ error: check.error });
   const cfg = check.value;
-
   const { url, headers, body } = buildChatRequest(cfg);
+
+  res.status(200);
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  res.write(': ka\n\n');
+
+  let closed = false;
+  let timedOut = false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, UPSTREAM_TIMEOUT_MS);
+  // Detect client disconnect: fires when the socket closes before the
+  // response is finished. (req 'close' fires as soon as the body is read,
+  // which would abort immediately — do NOT use it.)
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      closed = true;
+      controller.abort();
+    }
+  });
+
+  const heartbeat = setInterval(() => {
+    if (!closed) {
+      try { res.write(': ka\n\n'); } catch (e) { /* client gone */ }
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+
+  const send = (obj) => {
+    if (closed) return;
+    try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch (e) { /* ignore */ }
+  };
 
   try {
     const upstream = await fetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      signal: controller.signal,
     });
 
     if (!upstream.ok) {
       const errText = await upstream.text();
-      return res.status(upstream.status).type('application/json').send(errText.slice(0, 8000));
+      send({ error: `[${upstream.status}] ${String(errText).slice(0, 2000)}` });
+      send({ done: true });
+      return res.end();
     }
-
-    // --- Non-streaming: return complete text + real token usage ---
-    if (!cfg.stream) {
-      const data = await upstream.json();
-      return res.json({ text: extractText(cfg.providerType, data), usage: extractUsage(cfg.providerType, data) });
-    }
-
-    // --- Streaming: parse upstream SSE server-side, forward plain text ---
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
 
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder('utf-8');
-    let buffer = '';
-    let closed = false;
-    req.on('close', () => { closed = true; });
+    let text = '';
+    let usage = null;
 
-    while (!closed) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith(':') || !trimmed.startsWith('data: ')) continue;
-        const dataStr = trimmed.slice(6).trim();
-        if (dataStr === '[DONE]') continue;
-        try {
-          const delta = extractDelta(cfg.providerType, JSON.parse(dataStr));
-          if (delta) res.write(delta);
-        } catch (e) { /* non-JSON SSE line */ }
+    if (!cfg.stream) {
+      // Buffer the whole upstream body; heartbeats keep the client
+      // connection alive the entire time the model is thinking.
+      const chunks = [];
+      while (!closed) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(decoder.decode(value, { stream: true }));
+      }
+      const raw = chunks.join('');
+      try {
+        const data = JSON.parse(raw);
+        text = extractText(cfg.providerType, data);
+        usage = extractUsage(cfg.providerType, data);
+      } catch (e) {
+        text = raw.slice(0, 2000); // provider returned non-JSON body
+      }
+      send({ text, usage });
+    } else {
+      // Parse upstream SSE server-side, forward deltas as JSON-escaped
+      // events (safe against newlines).
+      let buffer = '';
+      while (!closed) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith(':') || !trimmed.startsWith('data: ')) continue;
+          const dataStr = trimmed.slice(6).trim();
+          if (dataStr === '[DONE]') continue;
+          try {
+            const delta = extractDelta(cfg.providerType, JSON.parse(dataStr));
+            if (delta) {
+              text += delta;
+              send({ t: delta });
+            }
+          } catch (e) { /* non-JSON SSE line */ }
+        }
       }
     }
 
+    send({ done: true });
     res.end();
   } catch (err) {
-    if (err.name === 'TimeoutError') {
-      return res.status(504).json({ error: 'Upstream request timed out' });
+    if (timedOut) {
+      send({ error: 'Upstream request timed out' });
+    } else if (!closed && err.name !== 'AbortError') {
+      console.error('chat error:', err.message);
+      send({ error: 'Upstream request failed' });
     }
-    if (err.name === 'AbortError') { try { res.end(); } catch (e) { /* noop */ } return; }
-    console.error('chat error:', err.message);
-    if (!res.headersSent) return res.status(502).json({ error: 'Upstream request failed' });
-    try { res.end(); } catch (e) { /* noop */ }
+    try { res.end(); } catch (e) { /* already ended */ }
+  } finally {
+    clearTimeout(timer);
+    clearInterval(heartbeat);
   }
 });
 
@@ -404,5 +459,5 @@ app.listen(PORT, () => {
   console.log(`OmniAI backend listening on port ${PORT}`);
   console.log(`Auth token: ${APP_TOKEN ? 'enabled' : 'DISABLED (set APP_SECRET_TOKEN for production)'}`);
   console.log(`CORS origins: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(', ') : 'any (set ALLOWED_ORIGIN for production)'}`);
-  console.log(`Rate limit: ${RATE_LIMIT} req/min per IP`);
+  console.log(`Rate limit: ${RATE_LIMIT} req/min per IP | upstream timeout: ${UPSTREAM_TIMEOUT_MS}ms | heartbeat: ${HEARTBEAT_INTERVAL_MS}ms`);
 });

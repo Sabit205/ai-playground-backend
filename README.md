@@ -42,9 +42,33 @@ npm start          # http://localhost:5000
 | `BLOCK_PRIVATE_HOSTS` | `true` blocks SSRF targets (localhost/private IPs). Leave unset to keep Ollama support. |
 | `UPSTREAM_TIMEOUT_MS` | Upstream call timeout (default `120000`). |
 
+| `UPSTREAM_TIMEOUT_MS` | Upstream call timeout (default `300000`). |
+| `HEARTBEAT_INTERVAL_MS` | SSE keep-alive comment interval during model silence (default `15000`). Prevents load-balancer/proxy idle timeouts (504s on Render). |
+
 Other protections included: `helmet` security headers, strict input validation
 (provider allowlist, URL scheme check, size caps, model-name charset), request
-body limits, and 4s/2min upstream timeouts.
+body limits, and upstream timeouts.
+
+## Streaming transport (504 prevention)
+
+`/api/chat` always responds with `Content-Type: text/event-stream`:
+
+- responds **immediately** (200 + first keep-alive), never leaving the proxy idle
+- emits `: ka` comment frames every 15s during any silence (model "thinking
+  time"), which proxies ignore but which keep the connection alive on Render
+- streamed deltas: `data: {"t":"..."}`
+- non-streaming clients still get a single final event:
+  `data: {"text":"...","usage":{...}}` — with heartbeats covering the wait
+- terminal event: `data: {"done":true}`; upstream failures after headers:
+  `data: {"error":"..."}`
+
+Test it locally:
+
+```
+node scripts/mock-provider.js                                  # fake slow provider
+APP_SECRET_TOKEN=test-secret-123 node server.js                # backend on :5000
+node scripts/smoke-relay.js                                    # runs both tests
+```
 
 ## Notes
 
